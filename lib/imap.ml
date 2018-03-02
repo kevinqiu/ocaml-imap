@@ -114,9 +114,9 @@ module Mutf7 = struct
       let upto j =
         let str = String.sub s i (j - i) and buf = Buffer.create 32 in
         recode ~encoding:`UTF_8 `UTF_16BE (`String str) (`Buffer buf);
-        let str = B64.encode ~pad:false (Buffer.contents buf) in
-        replace str '/' ',';
-        Buffer.add_string b str; Buffer.add_char b '-'
+        let bytes = Bytes.of_string (B64.encode ~pad:false (Buffer.contents buf)) in
+        replace bytes '/' ',';
+        Buffer.add_bytes b bytes; Buffer.add_char b '-'
       in
       let rec loop i =
         if i >= String.length s then
@@ -152,8 +152,10 @@ module Mutf7 = struct
         else begin
           match s.[i] with
           | '-' ->
-              let str = String.sub s start (i - start) in
-              replace str ',' '/';
+              let str = (String.sub s start (i - start)) in
+              let str = String.map (function
+                  | ',' -> '/'
+                  | c -> c) str in
               let str = B64.decode str in (* FIXME do we need to pad it with "===" ? *)
               recode ~encoding:`UTF_16BE `UTF_8 (`String str) (`Buffer b);
               a (i + 1)
@@ -1949,7 +1951,6 @@ type t =
     mutable debug: bool;
 
     mutable tag: int;
-    mutable unconsumed: A.unconsumed;
 
     mutable uidnext: uid option;
     mutable messages: int option;
@@ -1963,7 +1964,7 @@ type t =
     mutable stop_poll: (unit -> unit) option;
   }
 
-let create_connection sock unconsumed =
+let create_connection sock =
   let ic = Lwt_ssl.in_channel_of_descr sock in
   let oc = Lwt_ssl.out_channel_of_descr sock in
   {
@@ -1974,7 +1975,6 @@ let create_connection sock unconsumed =
     debug = true;
 
     tag = 0;
-    unconsumed;
     uidnext = None;
     uidvalidity = None;
     recent = None;
@@ -2013,18 +2013,13 @@ let unconsumed_to_string {A.buf; off; len} =
   done;
   Bytes.unsafe_to_string b
 
-let parse unconsumed p =
-  let input = `String (unconsumed_to_string unconsumed) in
-  A.parse ~input p
-
 let recv imap =
   let rec loop = function
     | A.Partial f ->
         Lwt_io.read_line imap.ic >>= fun line ->
         (if imap.debug then Lwt_io.eprintlf "> %s" line else Lwt.return_unit) >>= fun () ->
         loop (f (`String (line ^ "\r\n")))
-    | Done (unconsumed, r) ->
-        imap.unconsumed <- unconsumed;
+    | Done (_, r) ->
         begin if imap.debug then
           Lwt_io.eprintl (Sexplib.Sexp.to_string_hum (R.sexp_of_response r))
         else
@@ -2036,7 +2031,7 @@ let recv imap =
         Lwt_io.eprintlf "** Unconsumed: %S" (unconsumed_to_string unconsumed) >>= fun () ->
         Lwt.fail (Error (Decode_error (unconsumed_to_string unconsumed, backtrace, f)))
   in
-  loop (parse imap.unconsumed Decoder.response)
+  loop (Angstrom.Buffered.parse Decoder.response)
 
 let rec send imap r process res =
   match r with
@@ -2388,7 +2383,7 @@ let connect server ?(port = 993) username password ?read_only mailbox =
   Lwt_unix.connect sock addr >>= fun () ->
   Lwt_ssl.ssl_connect sock ctx >>= fun sock ->
   let imap =
-    create_connection sock {A.buf = Bigarray.Array1.create Bigarray.char Bigarray.c_layout 0; off = 0; len = 0}
+    create_connection sock
   in
   recv imap >>= function
   | R.Untagged _ ->
